@@ -145,8 +145,13 @@ fn default_name(dev: &Option<cpal::Device>) -> String {
 
 /// Abre la salida por defecto. Si no hay dispositivo (o no se pudo abrir) la app arranca igual con el
 /// formato 48 kHz estereo y `Output::check` reintenta cada segundo; el tercer valor es el aviso para el usuario.
+/// Depuracion: YTOP_NO_AUDIO=1 simula que no hay ningun dispositivo de audio.
+fn no_audio() -> bool {
+    std::env::var_os("YTOP_NO_AUDIO").is_some()
+}
+
 pub fn start_output() -> (Arc<Shared>, Output, Option<String>) {
-    let dev = cpal::default_host().default_output_device();
+    let dev = if no_audio() { None } else { cpal::default_host().default_output_device() };
     let name = default_name(&dev);
     let cfg = dev.as_ref().and_then(|d| d.default_output_config().ok());
     let (rate, channels) = cfg.map(|c| (c.sample_rate().0, c.channels() as usize)).unwrap_or((48_000, 2));
@@ -186,10 +191,15 @@ pub fn start_output() -> (Arc<Shared>, Output, Option<String>) {
 }
 
 impl Output {
+    /// true si hay una salida de audio abierta y funcionando.
+    pub fn is_open(&self) -> bool {
+        self.stream.is_some() && !self.failed.load(Relaxed)
+    }
+
     /// Si Windows cambio el dispositivo predeterminado (o el actual fallo), pasa el sonido al nuevo.
     /// Tambien abre la salida cuando al iniciar no habia ninguna.
     pub fn check(&mut self) {
-        let dev = cpal::default_host().default_output_device();
+        let dev = if no_audio() { None } else { cpal::default_host().default_output_device() };
         let name = default_name(&dev);
         let failed = self.failed.load(Relaxed);
         if name.is_empty() {
@@ -280,6 +290,7 @@ pub fn decode(sh: &Shared, gen: u64, src: Box<dyn MediaSource>) -> Result<bool, 
     let mut first = true;
     let mut sbuf: Option<SampleBuffer<f32>> = None;
     let mut tmp: Vec<f32> = Vec::new();
+    let mut bad = 0u32; // paquetes malformados seguidos
 
     loop {
         if sh.gen.load(Relaxed) != gen {
@@ -319,8 +330,17 @@ pub fn decode(sh: &Shared, gen: u64, src: Box<dyn MediaSource>) -> Result<bool, 
             }
             // corte de red o descarga interrumpida: no es el final de la pista
             Err(symphonia::core::errors::Error::IoError(e)) => return Err(format!("descarga interrumpida ({e})")),
-            Err(_) => break,
+            // datos malformados: se salta el paquete; si son demasiados seguidos, es un error (no el final)
+            Err(symphonia::core::errors::Error::DecodeError(m)) => {
+                bad += 1;
+                if bad > 50 {
+                    return Err(format!("datos de audio corruptos ({m})"));
+                }
+                continue;
+            }
+            Err(e) => return Err(format!("flujo de audio no valido ({e})")),
         };
+        bad = 0;
         if pkt.track_id() != tid {
             continue;
         }
@@ -347,13 +367,6 @@ pub fn decode(sh: &Shared, gen: u64, src: Box<dyn MediaSource>) -> Result<bool, 
             }
         }
     }
-    while !sh.ring.lock().unwrap().is_empty() {
-        if sh.gen.load(Relaxed) != gen {
-            return Ok(false);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Ok(true)
 }
 
 /// Buffer compartido que se va llenando mientras se descarga el audio.

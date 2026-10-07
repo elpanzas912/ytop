@@ -1452,6 +1452,7 @@ export component App inherits Window {
     in property <image> blank;
     in-out property <bool> queue-open: false;
     in-out property <bool> repaint-flag: false;
+    in-out property <string> audio-warn;
     in-out property <bool> login-open: false;
     in-out property <string> login-msg;
     in-out property <bool> login-ok: false;
@@ -2263,8 +2264,8 @@ export component App inherits Window {
                                 overflow: elide;
                             }
                             Text {
-                                text: root.np-title != "" ? root.np-artist : "Elegí algo del feed";
-                                color: #9a9aa0;
+                                text: root.audio-warn != "" ? root.audio-warn : (root.np-title != "" ? root.np-artist : "Elegí algo del feed");
+                                color: root.audio-warn != "" ? #ffb454 : #9a9aa0;
                                 font-size: 12px;
                                 overflow: elide;
                             }

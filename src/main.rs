@@ -65,7 +65,10 @@ struct State {
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
+/// Identifica cada peticion de datos (busqueda, pestaña, lista, cargar mas); solo vale el ultimo.
 static VIEW_GEN: AtomicU64 = AtomicU64::new(0);
+/// Identifica la tanda de miniaturas vigente (cambia con la vista o el tamaño de tarjeta).
+static THUMB_GEN: AtomicU64 = AtomicU64::new(0);
 static MODE_MANUAL: AtomicBool = AtomicBool::new(false);
 static AUDIO_SEL: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = pista por defecto (original)
 static QUALITY_SEL: AtomicI32 = AtomicI32::new(-1); // -1 = automatica
@@ -199,7 +202,11 @@ fn ytdlp(args: &[&str]) -> Result<String, String> {
         .map_err(|e| format!("yt-dlp: {e}"))?;
     if !out.status.success() {
         let e = String::from_utf8_lossy(&out.stderr);
-        return Err(e.lines().last().unwrap_or("error").chars().take(120).collect());
+        let line = e.lines().map(str::trim).rev().find(|l| l.starts_with("ERROR")).or_else(|| e.lines().map(str::trim).rev().find(|l| !l.is_empty()));
+        return Err(match line {
+            Some(l) => l.chars().take(120).collect(),
+            None => format!("yt-dlp termino con error ({})", out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into())),
+        });
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -958,14 +965,14 @@ fn thumb_worker() {
                 g = cv.wait(g).unwrap();
             }
         };
-        if VIEW_GEN.load(Relaxed) != gen {
+        if THUMB_GEN.load(Relaxed) != gen {
             continue;
         }
         let in_win = idx >= WIN_LO.load(Relaxed) && idx < WIN_HI.load(Relaxed);
         let buf = if in_win { thumb_bytes(&agent, &id, tier).and_then(|b| decode_thumb(&b, tier)).map(|b| { let t = dominant_tint(&b); (b, t) }) } else { None };
         let Some(w) = UIW.lock().unwrap().clone() else { continue };
         let _ = w.upgrade_in_event_loop(move |ui| {
-            if VIEW_GEN.load(Relaxed) != gen {
+            if THUMB_GEN.load(Relaxed) != gen {
                 return;
             }
             let wanted = STATE.with(|s| {
@@ -1000,7 +1007,7 @@ fn update_thumbs(ui: &App) {
     let cw = ui.get_cw();
     let tier: u8 = if cw > 560.0 { 2 } else if cw > 380.0 { 1 } else { 0 };
     if THUMB_TIER.swap(tier as usize, Relaxed) != tier as usize {
-        VIEW_GEN.fetch_add(1, Relaxed);
+        THUMB_GEN.fetch_add(1, Relaxed);
         let loaded: Vec<usize> = STATE.with(|s| {
             let mut s = s.borrow_mut();
             let v: Vec<usize> = (0..s.thumb_state.len()).filter(|&i| s.thumb_state[i] != 0).collect();
@@ -1025,7 +1032,7 @@ fn update_thumbs(ui: &App) {
     let hi = ((last_row + 2) * cols).min(n);
     WIN_LO.store(lo, Relaxed);
     WIN_HI.store(hi, Relaxed);
-    let gen = VIEW_GEN.load(Relaxed);
+    let gen = THUMB_GEN.load(Relaxed);
     let (elo, ehi) = (lo.saturating_sub(2 * cols), (hi + 2 * cols).min(n));
     let (mut jobs, mut evict, mut meta_ids) = (vec![], vec![], vec![]);
     STATE.with(|s| {
@@ -1068,7 +1075,7 @@ fn update_thumbs(ui: &App) {
 // Listas: mostrar, pestañas, busqueda y "cargar mas"
 // ---------------------------------------------------------------------
 fn set_view(ui: &App, tracks: Vec<Track>) {
-    VIEW_GEN.fetch_add(1, Relaxed);
+    THUMB_GEN.fetch_add(1, Relaxed);
     ui.invoke_scroll_top();
     let items: Vec<Item> = tracks.iter().map(item_for).collect();
     ui.set_items(ModelRc::new(VecModel::from(items)));
@@ -2637,6 +2644,8 @@ fn main() {
     let (sh, mut out, audio_warn) = audio::start_output();
     sh.volume.store(80, Relaxed);
     let ui = App::new().unwrap();
+    // aviso de audio (se mantiene aparte del estado mientras no haya una salida abierta)
+    let warn_text: String = audio_warn.unwrap_or_else(|| "Sin salida de audio: conectá un dispositivo y se activará solo".to_string());
 
     {
         let w = ui.as_weak();
@@ -2983,14 +2992,23 @@ fn main() {
     }
 
     // sigue al dispositivo de audio predeterminado de Windows
+    ui.set_audio_warn(if out.is_open() { "".into() } else { warn_text.clone().into() });
     let dev_timer = slint::Timer::default();
-    dev_timer.start(TimerMode::Repeated, Duration::from_millis(1000), move || out.check());
+    {
+        let w = ui.as_weak();
+        dev_timer.start(TimerMode::Repeated, Duration::from_millis(1000), move || {
+            out.check();
+            if let Some(ui) = w.upgrade() {
+                let msg: &str = if out.is_open() { "" } else { &warn_text };
+                if ui.get_audio_warn().as_str() != msg {
+                    ui.set_audio_warn(msg.into());
+                }
+            }
+        });
+    }
 
     start_sync_server(ui.as_weak());
     load_tab(&ui, 0);
-    if let Some(m) = audio_warn {
-        ui.set_status(m.into());
-    }
     ui.run().unwrap();
     sh.gen.fetch_add(1, Relaxed);
     stop_video();
