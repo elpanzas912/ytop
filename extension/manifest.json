@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "YT Op Sync",
+  "version": "1.0",
+  "description": "Pasa la sesion de YouTube de este Chrome a la app YT Op (solo en localhost).",
+  "permissions": ["cookies", "alarms"],
+  "host_permissions": ["*://*.youtube.com/*", "*://*.google.com/*", "http://127.0.0.1:9334/*"],
+  "background": { "service_worker": "background.js" }
+}

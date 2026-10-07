@@ -1,0 +1,12 @@
+# compilacion
+/target/
+
+# credenciales y datos locales: NUNCA subir
+cookies.txt
+cookies.txt.bak
+*.cookies
+*.log
+
+# copias de respaldo del editor
+*.bak
+*.bak[0-9]*
