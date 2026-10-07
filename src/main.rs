@@ -334,8 +334,6 @@ fn find_bars(img: &image::RgbaImage) -> (u32, u32, u32, u32) {
 /// atras va la misma imagen ampliada y difuminada. `out_w`: ancho final (por defecto el original).
 /// Radio de las esquinas de las miniaturas, como fraccion del ancho (12 px en una tarjeta de ~330 px).
 const CORNER: f32 = 0.036;
-/// Idem para los cuadros de video (16 px sobre ~900 px).
-const CORNER_V: f32 = 0.018;
 
 /// Redondea las esquinas de un buffer RGBA: el alfa baja a 0 fuera del arco (con 1 px de suavizado).
 /// El renderizador por software de Slint no recorta imagenes con esquinas redondeadas, por eso se hace aca.
@@ -1913,8 +1911,27 @@ fn mark_watched_later(sh: Arc<Shared>, gen: u64, id: String) {
 // ---------------------------------------------------------------------
 // Video (ffmpeg -> fotogramas RGBA sincronizados con el audio)
 // ---------------------------------------------------------------------
+/// Generacion de video cuyos cuadros se muestran, y ultima generacion pedida. Un pedido nuevo NO corta el video
+/// que se ve: arranca otro ffmpeg en paralelo y reemplaza al anterior recien cuando entrega su primer cuadro.
 static VGEN: AtomicU64 = AtomicU64::new(0);
-static VCHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+static VREQ: AtomicU64 = AtomicU64::new(0);
+static VCHILD: Mutex<Vec<(u64, std::process::Child)>> = Mutex::new(Vec::new());
+/// Demora medida (ms) entre pedir el video y recibir el primer cuadro: el nuevo ffmpeg apunta tanto adelante
+/// para que sus cuadros lleguen sincronizados con el audio en vez de descartarse por tarde.
+static VID_LAT_MS: AtomicU64 = AtomicU64::new(700);
+
+/// Mata y recoge el ffmpeg de su generacion al terminar el hilo (por cualquier camino).
+struct VGuard(u64);
+impl Drop for VGuard {
+    fn drop(&mut self) {
+        let mut g = VCHILD.lock().unwrap();
+        if let Some(i) = g.iter().position(|(x, _)| *x == self.0) {
+            let (_, mut c) = g.remove(i);
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
 static FRAME_PENDING: AtomicBool = AtomicBool::new(false);
 static FFMPEG: LazyLock<Option<PathBuf>> = LazyLock::new(find_ffmpeg);
 
@@ -1960,24 +1977,27 @@ fn find_ffmpeg() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
+/// Corta todo el video (ninguna generacion queda viva).
 fn stop_video() {
-    VGEN.fetch_add(1, Relaxed);
-    if let Some(mut c) = VCHILD.lock().unwrap().take() {
+    let g = VREQ.fetch_add(1, Relaxed) + 1;
+    VGEN.store(g, Relaxed);
+    for (_, mut c) in VCHILD.lock().unwrap().drain(..) {
         let _ = c.kill();
         let _ = c.wait();
     }
 }
 
+/// Pide un video nuevo (otro tamaño, calidad o posicion). El que se esta viendo sigue hasta que el nuevo este listo.
 fn start_video(w: Weak<App>, sh: Arc<Shared>, id: String, start_ms: u64, vw: usize, vh: usize) {
-    stop_video();
-    let vgen = VGEN.load(Relaxed);
+    let vgen = VREQ.fetch_add(1, Relaxed) + 1;
     std::thread::spawn(move || video_thread(w, sh, id, start_ms, vgen, vw, vh));
 }
 
 /// Video con ffmpeg ya escalado al tamaño exacto en que se dibuja: la interfaz lo copia 1:1 sin escalarlo.
-fn video_thread(w: Weak<App>, sh: Arc<Shared>, id: String, start_ms: u64, vgen: u64, vw: usize, vh: usize) {
+fn video_thread(w: Weak<App>, sh: Arc<Shared>, id: String, _start_ms: u64, vgen: u64, vw: usize, vh: usize) {
     let fps: u64 = if vw * vh > 2_500_000 { 24 } else { 30 };
-    let alive = || VGEN.load(Relaxed) == vgen;
+    // vivo mientras sea el video que se muestra o el ultimo pedido
+    let alive = || VGEN.load(Relaxed) == vgen || VREQ.load(Relaxed) == vgen;
     let say = |s: &str| {
         let s = s.to_string();
         let _ = w.upgrade_in_event_loop(move |ui| ui.set_status(s.into()));
@@ -1998,6 +2018,11 @@ fn video_thread(w: Weak<App>, sh: Arc<Shared>, id: String, start_ms: u64, vgen: 
     if !alive() {
         return;
     }
+    // el video arranca "adelantado" lo que tarda ffmpeg en entregar el primer cuadro, asi llega a tiempo
+    let lat = VID_LAT_MS.load(Relaxed);
+    let t_spawn = Instant::now();
+    let base_pos = sh.pos_ms();
+    let start_ms = if sh.paused.load(Relaxed) { base_pos } else { base_pos + lat };
     let mut cmd = Command::new(ff);
     cmd.args(["-loglevel", "quiet", "-probesize", "1000000", "-analyzeduration", "1000000", "-hwaccel", "auto"]);
     if start_ms > 500 {
@@ -2022,14 +2047,10 @@ fn video_thread(w: Weak<App>, sh: Arc<Shared>, id: String, start_ms: u64, vgen: 
         let _ = child.wait();
         return;
     };
-    {
-        let mut g = VCHILD.lock().unwrap();
-        if !alive() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        }
-        *g = Some(child);
+    VCHILD.lock().unwrap().push((vgen, child));
+    let _guard = VGuard(vgen); // al salir del hilo mata y recoge este ffmpeg
+    if !alive() {
+        return;
     }
     let mut k: u64 = 0;
     loop {
@@ -2039,16 +2060,14 @@ fn video_thread(w: Weak<App>, sh: Arc<Shared>, id: String, start_ms: u64, vgen: 
         // se lee directo al bufer final (sin copia intermedia)
         let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(vw as u32, vh as u32);
         if out.read_exact(buf.make_mut_bytes()).is_err() {
-            // ffmpeg termino o fallo: se recoge el proceso para no dejarlo colgado
-            if alive() {
-                if let Some(mut c) = VCHILD.lock().unwrap().take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-            }
-            return;
+            return; // ffmpeg termino o fallo; el guard lo recoge
         }
-        round_corners(buf.make_mut_bytes(), vw, vh, vw as f32 * CORNER_V);
+        if k == 0 {
+            // se aprende cuanto tarda en arrancar para apuntar mejor la proxima vez
+            let startup = t_spawn.elapsed().as_millis() as u64;
+            VID_LAT_MS.store(((lat + startup + 120) / 2).clamp(250, 2500), Relaxed);
+            audio::trace(&format!("video: primer cuadro decodificado ({startup} ms; adelanto {lat} ms)"));
+        }
         let ts = start_ms + k * 1000 / fps;
         k += 1;
         // esperar a que el audio llegue a este instante (o descartar si va tarde)
@@ -2069,11 +2088,48 @@ fn video_thread(w: Weak<App>, sh: Arc<Shared>, id: String, start_ms: u64, vgen: 
         }
         let _ = w.upgrade_in_event_loop(move |ui| {
             FRAME_PENDING.store(false, Relaxed);
-            if VGEN.load(Relaxed) == vgen {
+            // el primer cuadro del hilo mas nuevo lo "confirma" y reemplaza al anterior sin cortes
+            if VGEN.load(Relaxed) == vgen || VREQ.load(Relaxed) == vgen {
+                VGEN.store(vgen, Relaxed);
                 ui.set_np_frame(Image::from_rgba8(buf));
                 ui.set_np_frame_loaded(true);
             }
         });
+    }
+}
+
+/// Ancho (px fisicos) con el que se pidio el video actual; 0 = sin video.
+static CUR_VW: AtomicUsize = AtomicUsize::new(0);
+
+extern "system" {
+    fn GetSystemMetrics(index: i32) -> i32;
+}
+
+/// Ancho en px fisicos que corresponde al recuadro de video actual (par, hasta 2560). En pantalla completa se usa el
+/// tamaño de la pantalla desde que empieza la transicion, asi el video llega nitido cuando la ventana se agranda.
+fn desired_vw(ui: &App) -> usize {
+    if ui.get_cinema() {
+        let (sw, sh) = unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) };
+        if sw > 0 && sh > 0 {
+            return (sw.min(sh * 16 / 9) as usize).clamp(320, 2560) & !1;
+        }
+    }
+    ((ui.get_player_w() * ui.window().scale_factor()) as usize).clamp(320, 2560) & !1
+}
+
+/// Si el recuadro cambio de tamaño de verdad (la ventana paso a pantalla completa o volvio), se pide el video
+/// al tamaño nuevo; el que se ve sigue hasta que el nuevo este listo.
+fn video_resize_check(ui: &App, sh: &Arc<Shared>) {
+    if !(ui.get_full() && ui.get_video_mode()) {
+        return;
+    }
+    let cur = CUR_VW.load(Relaxed);
+    if cur == 0 {
+        return;
+    }
+    let want = desired_vw(ui);
+    if (want as f64 - cur as f64).abs() > cur as f64 * 0.08 {
+        sync_video(ui, sh);
     }
 }
 
@@ -2089,12 +2145,15 @@ fn sync_video(ui: &App, sh: &Arc<Shared>) {
     match id {
         Some(id) if ui.get_full() && ui.get_video_mode() => {
             // tamaño fisico exacto del recuadro de video (par, 16:9, hasta 2560 de ancho)
-            let sf = ui.window().scale_factor();
-            let vw = ((ui.get_player_w() * sf) as usize).clamp(320, 2560) & !1;
+            let vw = desired_vw(ui);
             let vh = (vw * 9 / 16) & !1;
+            CUR_VW.store(vw, Relaxed);
             start_video(ui.as_weak(), sh.clone(), id, sh.pos_ms(), vw, vh)
         }
-        _ => stop_video(),
+        _ => {
+            CUR_VW.store(0, Relaxed);
+            stop_video();
+        }
     }
 }
 
@@ -2430,6 +2489,7 @@ fn start(ui: &App, sh: &Arc<Shared>, i: usize) {
     audio::trace(&format!("CLIC en {}", t.id));
     let (s, w, id) = (sh.clone(), ui.as_weak(), t.id);
     std::thread::spawn(move || play_thread(s, gen, id, w, None));
+    stop_video(); // el video de la pista anterior no sigue vivo
     sync_video(ui, sh);
 }
 
@@ -2986,6 +3046,7 @@ fn main() {
         let (w, sh) = (ui.as_weak(), sh.clone());
         timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
             if let Some(ui) = w.upgrade() {
+                video_resize_check(&ui, &sh);
                 tick(&ui, &sh);
             }
         });

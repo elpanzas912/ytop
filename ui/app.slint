@@ -1420,7 +1420,7 @@ export component App inherits Window {
     preferred-width: 1100px;
     preferred-height: 720px;
     background: #030303;
-    full-screen: root.cinema;
+    full-screen: root.os-full;
 
     in property <[Item]> items;
     in property <string> heading;
@@ -1452,6 +1452,8 @@ export component App inherits Window {
     in property <image> blank;
     in-out property <bool> queue-open: false;
     in-out property <bool> repaint-flag: false;
+    // ventana del sistema en pantalla completa: se activa cuando termina la animacion del video (y se apaga al salir)
+    in-out property <bool> os-full: false;
     in-out property <string> audio-warn;
     in-out property <bool> login-open: false;
     in-out property <string> login-msg;
@@ -1525,6 +1527,17 @@ export component App inherits Window {
     changed cinema => {
         fs-focus.focus();
         root.cinema-changed();
+        if (!root.cinema) {
+            root.os-full = false;
+        }
+    }
+    // espera a que el video termine de llenar la ventana antes de pasarla a pantalla completa
+    Timer {
+        interval: 520ms;
+        running: root.cinema && !root.os-full;
+        triggered => {
+            root.os-full = true;
+        }
     }
     changed video-mode => {
         if (!root.video-mode) {
@@ -2458,6 +2471,22 @@ export component App inherits Window {
         property <length> mw: root.video-mode ? root.player-w : Math.min((root.height - 200px) * 16 / 9, fs.area-w * 0.46);
         property <length> mh: root.video-mode ? (root.cinema ? root.height : self.mw * 9 / 16) : self.mw * 9 / 16;
         property <length> pad: fs.area-w * 0.06;
+        // geometria normal del recuadro (cambia con el modo Audio/Video y se anima)
+        property <length> bx: root.video-mode ? (fs.area-w - fs.mw) / 2 : fs.pad;
+        property <length> by: root.video-mode ? 84px : (fs.height - fs.mh) / 2;
+        property <length> bw: fs.mw;
+        property <length> bh: fs.mh;
+        property <length> br: root.video-mode ? 0px : fs.mw * 0.036;
+        animate bx, by, bw, bh, br {
+            duration: 480ms;
+            easing: cubic-bezier(0.32, 0.72, 0, 1);
+        }
+        // avance 0..1 hacia pantalla completa: solo se anima el cambio de modo, no el tamaño de la ventana
+        property <float> ck: root.cinema ? 1 : 0;
+        animate ck {
+            duration: 480ms;
+            easing: cubic-bezier(0.32, 0.72, 0, 1);
+        }
         property <length> area-w: root.width - ((root.queue-open && !root.cinema) ? root.qw + 24px : 0px);
         x: 0px;
         y: root.full ? 0px : root.height;
@@ -2474,7 +2503,8 @@ export component App inherits Window {
             background: #000000;
             opacity: root.cinema ? 1 : 0;
             animate opacity {
-                duration: 250ms;
+                duration: 480ms;
+                easing: cubic-bezier(0.32, 0.72, 0, 1);
             }
         }
         TouchArea {
@@ -2628,31 +2658,34 @@ export component App inherits Window {
 
         // caratula grande / video
         Rectangle {
-            x: root.cinema ? 0px : (root.video-mode ? (fs.area-w - fs.mw) / 2 : fs.pad);
-            y: root.cinema ? 0px : (root.video-mode ? 84px : (parent.height - fs.mh) / 2);
-            width: root.cinema ? parent.width : fs.mw;
-            height: root.cinema ? parent.height : fs.mh;
-            border-radius: root.cinema ? 0px : (root.video-mode ? fs.mw * 0.018 : fs.mw * 0.036);
+            x: fs.bx * (1 - fs.ck);
+            y: fs.by * (1 - fs.ck);
+            width: fs.bw + (parent.width - fs.bw) * fs.ck;
+            height: fs.bh + (parent.height - fs.bh) * fs.ck;
+            border-radius: fs.br * (1 - fs.ck);
             background: #000000;
             clip: true;
-            animate x, y, width, height, border-radius {
-                duration: 380ms;
-                easing: cubic-bezier(0.16, 1, 0.3, 1);
-            }
+            // portadas: se ocultan cuando el video ya se ve (si no, asoman en las franjas negras al cambiar de tamaño)
             Image {
                 source: root.np-thumb;
                 width: 100%;
                 height: 100%;
                 image-fit: ImageFit.cover;
+                opacity: (root.video-mode && root.np-frame-loaded) ? 0 : 1;
+                animate opacity {
+                    duration: 140ms;
+                    delay: (root.video-mode && root.np-frame-loaded) ? 240ms : 0ms;
+                }
             }
             Image {
                 source: root.np-big;
                 width: 100%;
                 height: 100%;
                 image-fit: ImageFit.cover;
-                opacity: root.np-big-loaded ? 1 : 0;
+                opacity: (root.np-big-loaded && !(root.video-mode && root.np-frame-loaded)) ? 1 : 0;
                 animate opacity {
-                    duration: 250ms;
+                    duration: (root.video-mode && root.np-frame-loaded) ? 140ms : 250ms;
+                    delay: (root.video-mode && root.np-frame-loaded) ? 240ms : 0ms;
                     easing: cubic-bezier(0, 0, 0.2, 1);
                 }
             }
@@ -2683,13 +2716,13 @@ export component App inherits Window {
                 }
             }
             // pantalla completa: titulo arriba a la izquierda
-            if root.cinema: Rectangle {
+            Rectangle {
                 x: 0px;
                 y: 0px;
                 width: parent.width;
                 height: 130px;
                 background: @linear-gradient(180deg, #000000b0 0%, #00000000 100%);
-                opacity: root.chrome ? 1 : 0;
+                opacity: (root.cinema && root.chrome) ? 1 : 0;
                 animate opacity {
                     duration: 250ms;
                     easing: cubic-bezier(0, 0, 0.2, 1);
@@ -2716,6 +2749,10 @@ export component App inherits Window {
                 animate opacity {
                     duration: 250ms;
                     easing: cubic-bezier(0, 0, 0.2, 1);
+                }
+                animate height, s {
+                    duration: 480ms;
+                    easing: cubic-bezier(0.32, 0.72, 0, 1);
                 }
                 progress: root.progress;
                 time-text: root.time-text;
@@ -2754,9 +2791,15 @@ export component App inherits Window {
                     root.activity();
                 }
             }
-            if root.video-mode && !root.np-frame-loaded: Rectangle {
-                background: #00000099;
-                Dots {
+            Rectangle {
+                background: #00000055;
+                opacity: (root.video-mode && !root.np-frame-loaded) ? 1 : 0;
+                animate opacity {
+                    duration: 280ms;
+                    delay: (root.video-mode && !root.np-frame-loaded) ? 500ms : 0ms;
+                    easing: cubic-bezier(0, 0, 0.2, 1);
+                }
+                if root.video-mode && !root.np-frame-loaded: Dots {
                     tint: white;
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
@@ -2999,11 +3042,16 @@ export component App inherits Window {
         }
 
         // modo Video: titulo y canal debajo del video
-        if root.video-mode && !root.cinema: Rectangle {
+        Rectangle {
             x: (fs.area-w - fs.mw) / 2;
             y: 84px + fs.mh + 14px;
             width: fs.mw;
             height: 80px;
+            opacity: (root.video-mode && !root.cinema) ? 1 : 0;
+            animate opacity {
+                duration: 220ms;
+                easing: cubic-bezier(0, 0, 0.2, 1);
+            }
             VerticalLayout {
                 spacing: 4px;
                 Text {
@@ -3023,7 +3071,12 @@ export component App inherits Window {
         }
 
         // cola de reproduccion (modo Audio y Video)
-        if !root.cinema: Rectangle {
+        Rectangle {
+            opacity: root.cinema ? 0 : 1;
+            animate opacity {
+                duration: 220ms;
+                easing: cubic-bezier(0, 0, 0.2, 1);
+            }
             width: 44px;
             height: 40px;
             x: root.video-mode ? parent.width - 24px - self.width : parent.width - 80px - 12px - 44px - 12px - self.width;
@@ -3055,6 +3108,7 @@ export component App inherits Window {
                 fill: root.queue-open ? #111111 : white;
             }
             qb-ta := TouchArea {
+                enabled: !root.cinema;
                 mouse-cursor: pointer;
                 clicked => {
                     root.queue-open = !root.queue-open;
