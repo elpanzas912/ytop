@@ -110,12 +110,21 @@ fn build_stream(dev: &cpal::Device, sh: &Arc<Shared>, failed: &Arc<AtomicBool>) 
                             }
                         }
                         let t = st.pos as f32;
-                        for (oc, o) in frame.iter_mut().enumerate() {
-                            let sc = if ring_ch == 1 { Some(0) } else if oc < ring_ch { Some(oc) } else { None };
-                            *o = match sc {
-                                Some(c) => (st.a[c] + (st.b[c] - st.a[c]) * t) * vol,
-                                None => 0.0,
-                            };
+                        if dev_ch == 1 && ring_ch > 1 {
+                            // salida mono: se mezclan todos los canales
+                            let mut acc = 0.0;
+                            for c in 0..ring_ch {
+                                acc += st.a[c] + (st.b[c] - st.a[c]) * t;
+                            }
+                            frame[0] = acc / ring_ch as f32 * vol;
+                        } else {
+                            for (oc, o) in frame.iter_mut().enumerate() {
+                                let sc = if ring_ch == 1 { Some(0) } else if oc < ring_ch { Some(oc) } else { None };
+                                *o = match sc {
+                                    Some(c) => (st.a[c] + (st.b[c] - st.a[c]) * t) * vol,
+                                    None => 0.0,
+                                };
+                            }
                         }
                         st.pos += ratio;
                     }
@@ -134,12 +143,13 @@ fn default_name(dev: &Option<cpal::Device>) -> String {
     dev.as_ref().and_then(|d| d.name().ok()).unwrap_or_default()
 }
 
-/// Abre la salida por defecto.
-pub fn start_output() -> Result<(Arc<Shared>, Output), String> {
+/// Abre la salida por defecto. Si no hay dispositivo (o no se pudo abrir) la app arranca igual con el
+/// formato 48 kHz estereo y `Output::check` reintenta cada segundo; el tercer valor es el aviso para el usuario.
+pub fn start_output() -> (Arc<Shared>, Output, Option<String>) {
     let dev = cpal::default_host().default_output_device();
     let name = default_name(&dev);
-    let dev = dev.ok_or("sin dispositivo de audio")?;
-    let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
+    let cfg = dev.as_ref().and_then(|d| d.default_output_config().ok());
+    let (rate, channels) = cfg.map(|c| (c.sample_rate().0, c.channels() as usize)).unwrap_or((48_000, 2));
     let sh = Arc::new(Shared {
         ring: Mutex::new(VecDeque::with_capacity(96_000 * 2)),
         gen: AtomicU64::new(0),
@@ -148,22 +158,44 @@ pub fn start_output() -> Result<(Arc<Shared>, Output), String> {
         played: AtomicU64::new(0),
         base_ms: AtomicU64::new(0),
         seek_ms: AtomicI64::new(-1),
-        rate: cfg.sample_rate().0,
-        channels: cfg.channels() as usize,
+        rate,
+        channels: channels.max(1),
     });
     let failed = Arc::new(AtomicBool::new(false));
-    let stream = build_stream(&dev, &sh, &failed)?;
-    trace(&format!("audio: salida '{name}'"));
-    Ok((sh.clone(), Output { stream: Some(stream), name, sh, failed, last_try: std::time::Instant::now() }))
+    let mut warn = None;
+    let stream = match dev {
+        Some(d) => match build_stream(&d, &sh, &failed) {
+            Ok(st) => {
+                trace(&format!("audio: salida '{name}'"));
+                Some(st)
+            }
+            Err(e) => {
+                trace(&format!("audio: no se pudo abrir '{name}': {e}"));
+                warn = Some("No se pudo abrir el dispositivo de audio; se reintentará solo".to_string());
+                None
+            }
+        },
+        None => {
+            trace("audio: sin dispositivo de salida");
+            warn = Some("Sin dispositivo de audio: conectá uno y se activará solo".to_string());
+            None
+        }
+    };
+    let name = if stream.is_some() { name } else { String::new() };
+    (sh.clone(), Output { stream, name, sh, failed, last_try: std::time::Instant::now() }, warn)
 }
 
 impl Output {
     /// Si Windows cambio el dispositivo predeterminado (o el actual fallo), pasa el sonido al nuevo.
+    /// Tambien abre la salida cuando al iniciar no habia ninguna.
     pub fn check(&mut self) {
         let dev = cpal::default_host().default_output_device();
         let name = default_name(&dev);
         let failed = self.failed.load(Relaxed);
-        if name.is_empty() || (name == self.name && !failed) {
+        if name.is_empty() {
+            return; // sin dispositivo: se espera a que aparezca uno
+        }
+        if self.stream.is_some() && name == self.name && !failed {
             return;
         }
         if self.last_try.elapsed() < std::time::Duration::from_millis(900) {
@@ -269,6 +301,24 @@ pub fn decode(sh: &Shared, gen: u64, src: Box<dyn MediaSource>) -> Result<bool, 
         }
         let pkt = match format.next_packet() {
             Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // fin del archivo: se espera a que se vacie la cola, atendiendo un posible seek hacia atras
+                loop {
+                    if sh.gen.load(Relaxed) != gen {
+                        return Ok(false);
+                    }
+                    if sh.seek_ms.load(Relaxed) >= 0 {
+                        break;
+                    }
+                    if sh.ring.lock().unwrap().is_empty() {
+                        return Ok(true);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                continue;
+            }
+            // corte de red o descarga interrumpida: no es el final de la pista
+            Err(symphonia::core::errors::Error::IoError(e)) => return Err(format!("descarga interrumpida ({e})")),
             Err(_) => break,
         };
         if pkt.track_id() != tid {
@@ -288,8 +338,12 @@ pub fn decode(sh: &Shared, gen: u64, src: Box<dyn MediaSource>) -> Result<bool, 
         }
         let mut ring = sh.ring.lock().unwrap();
         for fr in tmp.chunks_exact(src_ch) {
-            for c in 0..oc {
-                ring.push_back(if src_ch == 1 { fr[0] } else { fr[c % src_ch] });
+            if oc == 1 && src_ch > 1 {
+                ring.push_back(fr.iter().sum::<f32>() / src_ch as f32);
+            } else {
+                for c in 0..oc {
+                    ring.push_back(if src_ch == 1 { fr[0] } else { fr[c % src_ch] });
+                }
             }
         }
     }
@@ -334,13 +388,21 @@ pub fn download(url: &str, buf: &Buf, sh: &Shared, gen: u64) {
     }
     let mut r = resp.into_reader();
     let mut chunk = [0u8; 32768];
+    let mut got: u64 = 0;
     loop {
         if sh.gen.load(Relaxed) != gen {
             return fail();
         }
         match r.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => {
+                let total = buf.total.load(Relaxed);
+                if total > 0 && got < total {
+                    return fail(); // el servidor cerro antes de enviar todo
+                }
+                break;
+            }
             Ok(n) => {
+                got += n as u64;
                 if buf.data.lock().unwrap().is_empty() {
                     trace("descarga: primeros bytes");
                 }

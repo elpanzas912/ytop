@@ -584,32 +584,6 @@ component Chip inherits Rectangle {
     }
 }
 
-component SegTab inherits Rectangle {
-    in property <string> label;
-    in property <bool> on;
-    out property <length> w: st-text.preferred-width + 30px;
-    callback clicked;
-    width: root.w;
-    height: 32px;
-    st-text := Text {
-        text: root.label;
-        color: root.on ? #111111 : (st-ta.has-hover ? #ffffff : #b4b4ba);
-        font-size: 14px;
-        font-weight: 600;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        animate color {
-            duration: 180ms;
-        }
-    }
-    st-ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => {
-            root.clicked();
-        }
-    }
-}
-
 component Tab inherits Rectangle {
     in property <string> label;
     in property <bool> on;
@@ -1068,188 +1042,6 @@ component SettingsMenu inherits Rectangle {
     }
 }
 
-// Panel del reproductor: titulo, canal, barra de progreso, controles y volumen.
-component PlayerPanel inherits Rectangle {
-    in property <string> title;
-    in property <string> artist;
-    in property <float> progress;
-    in property <string> elapsed;
-    in property <string> remaining;
-    in property <bool> paused;
-    in property <float> volume;
-    in property <float> s: 1;
-    callback toggle();
-    callback prev();
-    callback next();
-    callback seek(float);
-    callback volume-changed(float);
-
-    VerticalLayout {
-        spacing: 6px * root.s;
-        Text {
-            text: root.title;
-            color: #f2f2f7;
-            font-size: 22px * root.s;
-            font-weight: 700;
-            overflow: elide;
-        }
-        Text {
-            text: root.artist;
-            color: #9a9aa0;
-            font-size: 15px * root.s;
-            overflow: elide;
-        }
-        Rectangle {
-            height: 6px * root.s;
-        }
-        HBar {
-            thickness: 6px * root.s;
-            smooth: true;
-            value: root.progress;
-            changed(v) => {
-                root.seek(v);
-            }
-        }
-        HorizontalLayout {
-            Text {
-                text: root.elapsed;
-                color: #9a9aa0;
-                font-size: 14px * root.s;
-            }
-            Rectangle {
-                horizontal-stretch: 1;
-            }
-            Text {
-                text: root.remaining;
-                color: #9a9aa0;
-                font-size: 14px * root.s;
-            }
-        }
-        HorizontalLayout {
-            spacing: 28px * root.s;
-            Rectangle {
-                horizontal-stretch: 1;
-            }
-            Rectangle {
-                width: 52px * root.s;
-                height: 52px * root.s;
-                opacity: pp-prev.pressed ? 0.55 : 1;
-                animate opacity {
-                    duration: 100ms;
-                }
-                Path {
-                    width: 28px * root.s;
-                    height: 25px * root.s;
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    viewbox-width: 20;
-                    viewbox-height: 18;
-                    commands: "M 20 0 L 20 18 L 6 9 Z M 0 0 L 3 0 L 3 18 L 0 18 Z";
-                    fill: #eeeeef;
-                }
-                pp-prev := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => {
-                        root.prev();
-                    }
-                }
-            }
-            Rectangle {
-                width: 52px * root.s;
-                height: 52px * root.s;
-                opacity: pp-play.pressed ? 0.55 : 1;
-                animate opacity {
-                    duration: 100ms;
-                }
-                Path {
-                    width: 24px * root.s;
-                    height: 28px * root.s;
-                    x: (parent.width - self.width) / 2 + 2px * root.s;
-                    y: (parent.height - self.height) / 2;
-                    viewbox-width: 14;
-                    viewbox-height: 16;
-                    commands: "M 0 0 L 14 8 L 0 16 Z";
-                    fill: #eeeeef;
-                    opacity: root.paused ? 1 : 0;
-                    animate opacity {
-                        duration: 160ms;
-                    }
-                }
-                Path {
-                    width: 24px * root.s;
-                    height: 28px * root.s;
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    viewbox-width: 14;
-                    viewbox-height: 16;
-                    commands: "M 0 0 L 4 0 L 4 16 L 0 16 Z M 10 0 L 14 0 L 14 16 L 10 16 Z";
-                    fill: #eeeeef;
-                    opacity: root.paused ? 0 : 1;
-                    animate opacity {
-                        duration: 160ms;
-                    }
-                }
-                pp-play := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => {
-                        root.toggle();
-                    }
-                }
-            }
-            Rectangle {
-                width: 52px * root.s;
-                height: 52px * root.s;
-                opacity: pp-next.pressed ? 0.55 : 1;
-                animate opacity {
-                    duration: 100ms;
-                }
-                Path {
-                    width: 28px * root.s;
-                    height: 25px * root.s;
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    viewbox-width: 20;
-                    viewbox-height: 18;
-                    commands: "M 0 0 L 14 9 L 0 18 Z M 17 0 L 20 0 L 20 18 L 17 18 Z";
-                    fill: #eeeeef;
-                }
-                pp-next := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => {
-                        root.next();
-                    }
-                }
-            }
-            Rectangle {
-                horizontal-stretch: 1;
-                HorizontalLayout {
-                    alignment: end;
-                    spacing: 10px * root.s;
-                    VerticalLayout {
-                        alignment: center;
-                        Path {
-                            width: 16px * root.s;
-                            height: 14px * root.s;
-                            viewbox-width: 9;
-                            viewbox-height: 12;
-                            commands: "M 0 4 L 3 4 L 8 0 L 8 12 L 3 8 L 0 8 Z";
-                            fill: #d0d0d4;
-                        }
-                    }
-                    HBar {
-                        width: 110px * root.s;
-                        thickness: 5px * root.s;
-                        value: root.volume;
-                        changed(v) => {
-                            root.volume-changed(v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 // Boton en forma de pildora con icono (Reproducir todo / Aleatorio).
 component PillBtn inherits Rectangle {
     in property <string> label;
@@ -1659,6 +1451,7 @@ export component App inherits Window {
     in property <[Item]> no-items;
     in property <image> blank;
     in-out property <bool> queue-open: false;
+    in-out property <bool> repaint-flag: false;
     in-out property <bool> login-open: false;
     in-out property <string> login-msg;
     in-out property <bool> login-ok: false;
@@ -1699,7 +1492,6 @@ export component App inherits Window {
     callback volume-changed(float);
     callback search(string);
     callback select-tab(int);
-    callback login();
     callback video-changed(bool);
     callback full-changed(bool);
     callback hover-track(int, bool);
@@ -1785,7 +1577,7 @@ export component App inherits Window {
                 padding-left: 24px;
                 padding-right: 24px;
                 spacing: 12px;
-                alignment: start;
+                alignment: stretch;
                 // logo (como el de YouTube): icono rojo con triangulo + nombre
                 VerticalLayout {
                     alignment: center;
@@ -1839,8 +1631,10 @@ export component App inherits Window {
                 // buscador (como el de YouTube): campo + boton de lupa
                 VerticalLayout {
                     alignment: center;
+                    horizontal-stretch: 20;
+                    min-width: 200px;
+                    max-width: 560px;
                     Rectangle {
-                        width: Math.max(200px, Math.min(560px, root.width - 600px));
                         height: 40px;
                         border-radius: 20px;
                         background: input.has-focus ? #0f0f0f : #121212;
@@ -2632,6 +2426,15 @@ export component App inherits Window {
                 }
             }
         }
+    }
+
+    // fuerza el repintado completo de la ventana (se alterna desde Rust al restaurarla)
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: root.repaint-flag ? #00000001 : #00000000;
     }
 
     // barra de carga superior (como la de YouTube): un tramo rojo que recorre el ancho

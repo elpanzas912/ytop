@@ -42,12 +42,6 @@ struct ViewSrc {
     lists: bool,
 }
 
-/// Lista de reproduccion abierta (pagina de lista).
-#[derive(Clone)]
-struct PageInfo {
-    title: String,
-}
-
 /// Lo que se veia antes de abrir una lista (para el boton Volver).
 struct BackView {
     tab: i32,
@@ -65,7 +59,6 @@ struct State {
     thumb_state: Vec<u8>, // 0 sin imagen, 1 en cola, 2 cargada
     src: Option<ViewSrc>,
     queue_title: String,
-    page: Option<PageInfo>,
     back: Option<BackView>,
 }
 
@@ -73,7 +66,6 @@ thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
 static VIEW_GEN: AtomicU64 = AtomicU64::new(0);
-static LOGIN_RUNNING: AtomicBool = AtomicBool::new(false);
 static MODE_MANUAL: AtomicBool = AtomicBool::new(false);
 static AUDIO_SEL: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = pista por defecto (original)
 static QUALITY_SEL: AtomicI32 = AtomicI32::new(-1); // -1 = automatica
@@ -88,14 +80,15 @@ fn data_dir() -> PathBuf {
 }
 
 fn cookies_path() -> Option<PathBuf> {
-    let mut cands = vec![data_dir().join("cookies.txt")];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() {
-            cands.push(d.join("cookies.txt"));
-        }
-    }
-    cands.push(PathBuf::from("cookies.txt"));
-    cands.into_iter().find(|p| p.exists())
+    // solo %APPDATA%\ytop\cookies.txt: nunca el directorio actual ni el del exe (podrian ser una copia olvidada)
+    let p = data_dir().join("cookies.txt");
+    p.exists().then_some(p)
+}
+
+/// true para youtube.com / google.com y sus subdominios (no para "notyoutube.com").
+fn yt_domain(d: &str) -> bool {
+    let d = d.trim_start_matches('.');
+    d == "youtube.com" || d.ends_with(".youtube.com") || d == "google.com" || d.ends_with(".google.com")
 }
 
 fn now_secs() -> u64 {
@@ -116,7 +109,7 @@ fn cookies_to_netscape(txt: &str) -> Result<(String, usize), String> {
         let arr = if let Some(a) = v.as_array() { a.clone() } else { v["cookies"].as_array().cloned().ok_or("No encontre la lista de cookies en el JSON")? };
         for c in arr {
             let domain = c["domain"].as_str().unwrap_or("");
-            if !(domain.contains("youtube.com") || domain.contains("google.com")) {
+            if !yt_domain(domain) {
                 continue;
             }
             let (name, value) = (c["name"].as_str().unwrap_or(""), c["value"].as_str().unwrap_or(""));
@@ -226,7 +219,8 @@ fn urlenc(s: &str) -> String {
 fn list(source: &str, n: usize, only_music: bool, lists: bool) -> Result<Vec<Track>, String> {
     let n = n.to_string();
     let mut out = String::new();
-    for _ in 0..5 {
+    // el feed recomendado a veces vuelve vacio; un historial o 'Me gusta' vacio de verdad no se reintenta 5 veces
+    for _ in 0..(if source.starts_with(':') { 5 } else { 2 }) {
         out = ytdlp(&[
             "--flat-playlist",
             "--playlist-end",
@@ -284,7 +278,12 @@ fn list(source: &str, n: usize, only_music: bool, lists: bool) -> Result<Vec<Tra
 }
 
 fn fmt(ms: u64) -> String {
-    format!("{}:{:02}", ms / 60000, ms / 1000 % 60)
+    let (h, m, s) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 fn near(a: [u8; 3], b: [u8; 3], t: i32) -> bool {
@@ -417,14 +416,15 @@ static UIW: Mutex<Option<Weak<App>>> = Mutex::new(None);
 
 fn fmt_views(n: u64) -> String {
     let dec = |v: f64| format!("{v:.1}").replace('.', ",");
-    if n >= 1_000_000_000 {
+    // los umbrales estan un poco por debajo para que el redondeo no muestre "1000 K" ni "1000 M"
+    if n >= 999_500_000 {
         format!("{} mil M vistas", dec(n as f64 / 1e9))
-    } else if n >= 1_000_000 {
+    } else if n >= 999_500 {
         let v = n as f64 / 1e6;
-        if v >= 100.0 { format!("{v:.0} M vistas") } else { format!("{} M vistas", dec(v)) }
+        if v >= 99.5 { format!("{v:.0} M vistas") } else { format!("{} M vistas", dec(v)) }
     } else if n >= 1_000 {
         let v = n as f64 / 1e3;
-        if v >= 100.0 { format!("{v:.0} K vistas") } else { format!("{} K vistas", dec(v)) }
+        if v >= 99.5 { format!("{v:.0} K vistas") } else { format!("{} K vistas", dec(v)) }
     } else {
         format!("{n} vistas")
     }
@@ -452,8 +452,8 @@ fn rel_date(d: &str) -> String {
         0 => "hoy".to_string(),
         1..=6 => plural(diff, "dia", "dias"),
         7..=29 => plural(diff / 7, "semana", "semanas"),
-        30..=364 => plural(diff / 30, "mes", "meses"),
-        _ => plural(diff / 365, "año", "años"),
+        30..=359 => plural(diff / 30, "mes", "meses"),
+        _ => plural((diff / 365).max(1), "año", "años"),
     }
 }
 
@@ -634,7 +634,7 @@ static METAQ: LazyLock<(Mutex<VecDeque<String>>, Condvar)> = LazyLock::new(|| (M
 /// (cabecera Cookie, SAPISID) a partir del cookies.txt de la app.
 fn yt_auth() -> Option<(String, String)> {
     let txt = std::fs::read_to_string(cookies_path()?).ok()?;
-    let (mut pairs, mut sapisid) = (vec![], String::new());
+    let (mut pairs, mut sapisid, mut sapisid3) = (vec![], String::new(), String::new());
     for l in txt.lines() {
         let l = l.strip_prefix("#HttpOnly_").unwrap_or(l);
         if l.starts_with('#') || l.trim().is_empty() {
@@ -645,10 +645,14 @@ fn yt_auth() -> Option<(String, String)> {
             pairs.push(format!("{}={}", f[5], f[6]));
             if f[5] == "SAPISID" {
                 sapisid = f[6].to_string();
+            } else if f[5] == "__Secure-3PAPISID" {
+                sapisid3 = f[6].to_string();
             }
         }
     }
-    (!sapisid.is_empty()).then(|| (pairs.join("; "), sapisid))
+    // la sesion vale con cualquiera de las dos (llevan el mismo valor)
+    let key = if sapisid.is_empty() { sapisid3 } else { sapisid };
+    (!key.is_empty()).then(|| (pairs.join("; "), key))
 }
 
 /// Vistas y fecha (AAAAMMDD) desde el endpoint de reproduccion de YouTube, con la sesion de la app (~40 KB).
@@ -782,6 +786,8 @@ fn meta_worker() {
 // ---------------------------------------------------------------------
 static AV: LazyLock<Mutex<HashMap<String, Option<SharedPixelBuffer<Rgba8Pixel>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static AVQ: LazyLock<(Mutex<VecDeque<String>>, Condvar)> = LazyLock::new(|| (Mutex::new(VecDeque::new()), Condvar::new()));
+/// Canales cuyo avatar fallo y cuando: se reintenta a los 5 minutos.
+static AVFAIL: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn find_sub(h: &[u8], n: &[u8], from: usize) -> Option<usize> {
     if h.len() < n.len() {
@@ -858,8 +864,18 @@ fn avatar_worker() {
         if AV.lock().unwrap().contains_key(&cid) {
             continue;
         }
+        if AVFAIL.lock().unwrap().get(&cid).map(|t| t.elapsed() < Duration::from_secs(300)).unwrap_or(false) {
+            continue;
+        }
         let buf = load_avatar(&cid);
-        AV.lock().unwrap().insert(cid.clone(), buf.clone());
+        match &buf {
+            Some(_) => {
+                AV.lock().unwrap().insert(cid.clone(), buf.clone());
+            }
+            None => {
+                AVFAIL.lock().unwrap().insert(cid.clone(), Instant::now());
+            }
+        }
         if let (Some(buf), Some(w)) = (buf, UIW.lock().unwrap().clone()) {
             let _ = w.upgrade_in_event_loop(move |ui| {
                 let m = ui.get_items();
@@ -1072,7 +1088,11 @@ fn set_view(ui: &App, tracks: Vec<Track>) {
     update_thumbs(ui);
 }
 
-fn show_result(ui: &App, tab: i32, r: Result<Vec<Track>, String>, cache: bool) {
+/// `gen`: identificador de la peticion (VIEW_GEN al lanzarla); si ya hay una mas nueva, el resultado se descarta.
+fn show_result(ui: &App, tab: i32, r: Result<Vec<Track>, String>, cache: bool, gen: u64) {
+    if VIEW_GEN.load(Relaxed) != gen {
+        return;
+    }
     ui.set_loading(false);
     match r {
         Ok(t) => {
@@ -1104,11 +1124,12 @@ fn load_tab(ui: &App, tab: i32) {
     ui.set_heading(heading.into());
     STATE.with(|s| s.borrow_mut().src = Some(ViewSrc { tab, source: source.to_string(), n, music: tab == 0, query: None, lists: tab == 4 }));
     if let Some(c) = STATE.with(|s| s.borrow().cache.get(&tab).cloned()) {
+        VIEW_GEN.fetch_add(1, Relaxed); // descarta cualquier peticion todavia en curso
         ui.set_status("".into());
         ui.set_loading(false);
         return set_view(ui, c);
     }
-    VIEW_GEN.fetch_add(1, Relaxed);
+    let gen = VIEW_GEN.fetch_add(1, Relaxed) + 1;
     ui.set_items(ModelRc::new(VecModel::from(vec![])));
     ui.set_can_more(false);
     ui.set_status("".into());
@@ -1121,7 +1142,7 @@ fn load_tab(ui: &App, tab: i32) {
                 add_mixes(v);
             }
         }
-        let _ = w.upgrade_in_event_loop(move |ui| show_result(&ui, tab, r, tab != 3));
+        let _ = w.upgrade_in_event_loop(move |ui| show_result(&ui, tab, r, tab != 3, gen));
     });
 }
 
@@ -1176,7 +1197,7 @@ fn do_search(ui: &App, q: String, lists: bool) {
             lists,
         })
     });
-    VIEW_GEN.fetch_add(1, Relaxed);
+    let gen = VIEW_GEN.fetch_add(1, Relaxed) + 1;
     ui.set_items(ModelRc::new(VecModel::from(vec![])));
     ui.set_can_more(false);
     ui.set_status("".into());
@@ -1184,7 +1205,7 @@ fn do_search(ui: &App, q: String, lists: bool) {
     let w = ui.as_weak();
     std::thread::spawn(move || {
         let r = if lists { list(&list_url, 25, false, true) } else { list(&format!("ytsearch25:{q}"), 25, false, false) };
-        let _ = w.upgrade_in_event_loop(move |ui| show_result(&ui, 2, r, false));
+        let _ = w.upgrade_in_event_loop(move |ui| show_result(&ui, 2, r, false, gen));
     });
 }
 
@@ -1200,7 +1221,6 @@ fn open_list(ui: &App, idx: usize) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         s.back = Some(BackView { tab: ui.get_tab(), heading: ui.get_heading().to_string(), tracks: s.view.clone(), src: s.src.clone() });
-        s.page = Some(PageInfo { title: t.title.clone() });
     });
     ui.set_list_mode(true);
     ui.set_tab(5);
@@ -1216,7 +1236,7 @@ fn open_list(ui: &App, idx: usize) {
         format!("https://www.youtube.com/playlist?list={}", t.id)
     };
     STATE.with(|s| s.borrow_mut().src = Some(ViewSrc { tab: 5, source: source.clone(), n: 100, music: false, query: None, lists: false }));
-    VIEW_GEN.fetch_add(1, Relaxed);
+    let gen = VIEW_GEN.fetch_add(1, Relaxed) + 1;
     ui.set_items(ModelRc::new(VecModel::from(vec![])));
     ui.set_can_more(false);
     ui.set_status("".into());
@@ -1229,12 +1249,13 @@ fn open_list(ui: &App, idx: usize) {
             Some(v) => Ok(v),
             None => list(&source, 100, false, false),
         };
-        let _ = w.upgrade_in_event_loop(move |ui| show_result(&ui, 5, r, false));
+        let _ = w.upgrade_in_event_loop(move |ui| show_result(&ui, 5, r, false, gen));
     });
 }
 
 fn list_back(ui: &App) {
     let Some(b) = STATE.with(|s| s.borrow_mut().back.take()) else { return load_tab(ui, 4) };
+    VIEW_GEN.fetch_add(1, Relaxed); // descarta la carga de la lista que se estaba abriendo
     ui.set_list_mode(false);
     ui.set_tab(b.tab);
     ui.set_heading(b.heading.into());
@@ -1295,17 +1316,24 @@ fn load_queue_thumbs(w: Weak<App>, ids: Vec<(usize, String, String)>) {
     }
 }
 
+/// Indice (en la cola completa) del primer item que muestra el panel de cola.
+static QBASE: AtomicUsize = AtomicUsize::new(0);
+
 /// Muestra la cola actual (lista, mix o lo que se estaba viendo) en el panel del reproductor.
+/// Se muestran hasta 200 items alrededor de la pista actual.
 fn publish_queue(ui: &App) {
-    let (items, ids, title, cur) = STATE.with(|s| {
+    let (items, ids, title, cur, base) = STATE.with(|s| {
         let s = s.borrow();
-        let items: Vec<Item> = s.queue.iter().take(200).map(item_for).collect();
-        let ids: Vec<(usize, String, String)> = s.queue.iter().take(60).enumerate().map(|(i, t)| (i, t.id.clone(), t.thumb_id.clone())).collect();
-        (items, ids, s.queue_title.clone(), s.cur.unwrap_or(0))
+        let cur = s.cur.unwrap_or(0);
+        let base = if cur >= 150 { cur - 100 } else { 0 };
+        let items: Vec<Item> = s.queue.iter().skip(base).take(200).map(item_for).collect();
+        let ids: Vec<(usize, String, String)> = s.queue.iter().skip(base).take(60).enumerate().map(|(i, t)| (i, t.id.clone(), t.thumb_id.clone())).collect();
+        (items, ids, s.queue_title.clone(), cur, base)
     });
+    QBASE.store(base, Relaxed);
     ui.set_queue_items(ModelRc::new(VecModel::from(items)));
     ui.set_queue_title(title.into());
-    ui.set_queue_cur(cur as i32);
+    ui.set_queue_cur((cur - base) as i32);
     load_queue_thumbs(ui.as_weak(), ids);
 }
 
@@ -1349,6 +1377,13 @@ fn start_mix(ui: &App) {
         };
         let _ = w.upgrade_in_event_loop(move |ui| {
             ui.set_status("".into());
+            let same = STATE.with(|s| {
+                let s = s.borrow();
+                s.cur.and_then(|c| s.queue.get(c)).map(|x| x.id == t.id).unwrap_or(false)
+            });
+            if !same {
+                return; // se cambio de pista mientras se armaba el mix
+            }
             match r {
                 Ok(mut v) if !v.is_empty() => {
                     if v[0].id != t.id {
@@ -1632,8 +1667,7 @@ fn qlabel(o: &VideoOpt) -> String {
 fn parse_formats(j: &str, u: &mut Urls) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else { return };
     let Some(arr) = v.as_array() else { return };
-    let mut audio: Vec<AudioOpt> = vec![];
-    let mut langs: Vec<String> = vec![];
+    let mut audio: Vec<(String, f64, AudioOpt)> = vec![]; // (idioma, kbps, pista): una por idioma, la de mayor calidad
     for f in arr {
         let id = f["format_id"].as_str().unwrap_or("");
         let url = f["url"].as_str().unwrap_or("");
@@ -1641,13 +1675,16 @@ fn parse_formats(j: &str, u: &mut Urls) {
             continue;
         }
         let lang = f["language"].as_str().unwrap_or("").to_string();
-        if !lang.is_empty() && langs.contains(&lang) {
-            continue;
-        }
-        langs.push(lang.clone());
+        let tbr = f["tbr"].as_f64().unwrap_or(0.0);
         let note = f["format_note"].as_str().unwrap_or("");
-        audio.push(AudioOpt { label: audio_label(&lang, note), url: url.to_string(), original: note.contains("original") });
+        let opt = AudioOpt { label: audio_label(&lang, note), url: url.to_string(), original: note.contains("original") };
+        match audio.iter_mut().find(|(l, _, _)| *l == lang) {
+            Some(e) if tbr > e.1 => *e = (lang, tbr, opt),
+            Some(_) => {}
+            None => audio.push((lang, tbr, opt)),
+        }
     }
+    let mut audio: Vec<AudioOpt> = audio.into_iter().map(|(_, _, o)| o).collect();
     audio.sort_by(|a, b| b.original.cmp(&a.original).then(a.label.cmp(&b.label)));
     u.audio_opts = audio;
 
@@ -1811,7 +1848,12 @@ fn load_cues(w: Weak<App>, id: String, want: bool) {
             .unwrap_or_default();
         cues.sort_by_key(|c| c.start);
         audio::trace(&format!("subtitulos: {} lineas", cues.len()));
-        *CUES.lock().unwrap() = (id, cues);
+        let _ = w.upgrade_in_event_loop(move |ui| {
+            // solo si la pista sigue siendo la misma (si no, se mostrarian subtitulos ajenos)
+            if ui.get_playing_id().as_str() == id {
+                *CUES.lock().unwrap() = (id, cues);
+            }
+        });
     });
 }
 
@@ -1864,14 +1906,23 @@ fn mark_watched_later(sh: Arc<Shared>, gen: u64, id: String) {
 // ---------------------------------------------------------------------
 // Video (ffmpeg -> fotogramas RGBA sincronizados con el audio)
 // ---------------------------------------------------------------------
-const VW: usize = 640;
-const VH: usize = 360;
-const FPS: u64 = 24;
-
 static VGEN: AtomicU64 = AtomicU64::new(0);
 static VCHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 static FRAME_PENDING: AtomicBool = AtomicBool::new(false);
 static FFMPEG: LazyLock<Option<PathBuf>> = LazyLock::new(find_ffmpeg);
+
+/// true si `exe` es un ffmpeg moderno: hay "shims" y builds de 2013 en el PATH que fallan con las opciones que usamos.
+fn ffmpeg_ok(exe: &std::path::Path) -> bool {
+    let Ok(o) = Command::new(exe).arg("-version").stdin(Stdio::null()).creation_flags(0x0800_0000).output() else { return false };
+    let t = String::from_utf8_lossy(&o.stdout);
+    let Some(v) = t.lines().next().and_then(|l| l.strip_prefix("ffmpeg version ")) else { return false };
+    let tok = v.split_whitespace().next().unwrap_or("");
+    if let Some(n) = tok.strip_prefix("N-") {
+        return n.split('-').next().and_then(|x| x.parse::<u32>().ok()).map(|x| x >= 90_000).unwrap_or(true);
+    }
+    let major: String = tok.trim_start_matches('n').chars().take_while(|c| c.is_ascii_digit()).collect();
+    major.parse::<u32>().map(|m| m >= 4).unwrap_or(true)
+}
 
 fn find_ffmpeg() -> Option<PathBuf> {
     let mut c = vec![data_dir().join("ffmpeg.exe")];
@@ -1882,6 +1933,15 @@ fn find_ffmpeg() -> Option<PathBuf> {
     }
     if let Some(p) = c.into_iter().find(|p| p.exists()) {
         return Some(p);
+    }
+    // cualquier ffmpeg.exe del PATH que sea moderno
+    if let Some(path) = std::env::var_os("PATH") {
+        for d in std::env::split_paths(&path) {
+            let p = d.join("ffmpeg.exe");
+            if p.exists() && ffmpeg_ok(&p) {
+                return Some(p);
+            }
+        }
     }
     let out = Command::new("python")
         .args(["-c", "import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())"])
@@ -1950,11 +2010,16 @@ fn video_thread(w: Weak<App>, sh: Arc<Shared>, id: String, start_ms: u64, vgen: 
         Err(e) => return say(&format!("ffmpeg: {e}")),
     };
     audio::trace("video: ffmpeg iniciado");
-    let Some(mut out) = child.stdout.take() else { return };
+    let Some(mut out) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
     {
         let mut g = VCHILD.lock().unwrap();
         if !alive() {
             let _ = child.kill();
+            let _ = child.wait();
             return;
         }
         *g = Some(child);
@@ -1967,6 +2032,13 @@ fn video_thread(w: Weak<App>, sh: Arc<Shared>, id: String, start_ms: u64, vgen: 
         // se lee directo al bufer final (sin copia intermedia)
         let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(vw as u32, vh as u32);
         if out.read_exact(buf.make_mut_bytes()).is_err() {
+            // ffmpeg termino o fallo: se recoge el proceso para no dejarlo colgado
+            if alive() {
+                if let Some(mut c) = VCHILD.lock().unwrap().take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
             return;
         }
         round_corners(buf.make_mut_bytes(), vw, vh, vw as f32 * CORNER_V);
@@ -2114,7 +2186,8 @@ fn play_thread(sh: Arc<Shared>, gen: u64, id: String, w: Weak<App>, resumed: Opt
     let say = |s: String| {
         let _ = w.upgrade_in_event_loop(move |ui| ui.set_status(s.into()));
     };
-    for attempt in 0..2 {
+    let mut resume = resumed;
+    for attempt in 0..3 {
         let u = match resolve(&id) {
             Ok(u) => u,
             Err(e) => return say(friendly(&e)),
@@ -2160,8 +2233,9 @@ fn play_thread(sh: Arc<Shared>, gen: u64, id: String, w: Weak<App>, resumed: Opt
             std::thread::spawn(move || mark_watched_later(s, gen, i));
         }
         // al cambiar de pista de audio se retoma en el mismo punto
-        if let Some(ms) = resumed {
-            audio::trace(&format!("pista de audio: reanudo en {ms} ms"));
+        if let Some(ms) = resume {
+            audio::trace(&format!("reanudo en {ms} ms"));
+            sh.ring.lock().unwrap().clear();
             sh.base_ms.store(ms, Relaxed);
             sh.played.store(0, Relaxed);
             sh.seek_ms.store(ms as i64, Relaxed);
@@ -2178,11 +2252,12 @@ fn play_thread(sh: Arc<Shared>, gen: u64, id: String, w: Weak<App>, resumed: Opt
             }
             Ok(false) => return,
             Err(e) => {
-                // URL vencida o descarga fallida: reintentar una vez con una URL nueva
+                // URL vencida o corte de red: reintentar con una URL nueva retomando donde quedo
                 invalidate(&id);
-                if attempt == 1 || sh.gen.load(Relaxed) != gen {
+                if attempt == 2 || sh.gen.load(Relaxed) != gen {
                     return say(format!("Reproduccion: {e}"));
                 }
+                resume = Some(sh.pos_ms());
             }
         }
     }
@@ -2297,7 +2372,14 @@ fn start(ui: &App, sh: &Arc<Shared>, i: usize) {
     ui.set_np_title(t.title.clone().into());
     ui.set_np_artist(t.artist.clone().into());
     ui.set_playing_id(t.id.clone().into());
-    ui.set_queue_cur(i as i32);
+    {
+        let base = QBASE.load(Relaxed);
+        if i < base || i >= base + 200 {
+            publish_queue(ui); // la pista quedo fuera de la ventana mostrada
+        } else {
+            ui.set_queue_cur((i - base) as i32);
+        }
+    }
     ui.set_progress(0.0);
     ui.set_np_loaded(false);
     let m = ui.get_items();
@@ -2355,51 +2437,19 @@ fn advance(ui: &App, sh: &Arc<Shared>, delta: i32) {
     }
 }
 
-fn browser_path() -> Option<PathBuf> {
-    let var = |k: &str| std::env::var(k).unwrap_or_default();
-    let (pf, pf86, la) = (var("ProgramFiles"), var("ProgramFiles(x86)"), var("LOCALAPPDATA"));
-    [
-        format!(r"{pf}\Google\Chrome\Application\chrome.exe"),
-        format!(r"{pf86}\Google\Chrome\Application\chrome.exe"),
-        format!(r"{la}\Google\Chrome\Application\chrome.exe"),
-        format!(r"{pf86}\Microsoft\Edge\Application\msedge.exe"),
-        format!(r"{pf}\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .find(|p| p.exists())
-}
-
-/// Lee todas las cookies del navegador de login por el protocolo de depuracion.
-fn fetch_cookies(port: u16) -> Option<Vec<serde_json::Value>> {
-    let v: serde_json::Value = ureq::get(&format!("http://127.0.0.1:{port}/json/version")).timeout(Duration::from_secs(2)).call().ok()?.into_string().ok().and_then(|t| serde_json::from_str(&t).ok())?;
-    let (mut sock, _) = tungstenite::connect(v["webSocketDebuggerUrl"].as_str()?).ok()?;
-    sock.send(tungstenite::Message::Text(r#"{"id":1,"method":"Storage.getCookies"}"#.into())).ok()?;
-    loop {
-        if let tungstenite::Message::Text(t) = sock.read().ok()? {
-            let j: serde_json::Value = serde_json::from_str(&t).ok()?;
-            if j["id"] == 1 {
-                return j["result"]["cookies"].as_array().cloned();
-            }
-        }
-    }
-}
-
 fn save_cookies(cs: &[serde_json::Value]) -> usize {
-    let mut out = String::from("# Netscape HTTP Cookie File
-");
+    let mut out = String::from("# Netscape HTTP Cookie File\n");
     let mut n = 0;
     for c in cs {
         let d = c["domain"].as_str().unwrap_or("");
-        if !(d.ends_with("youtube.com") || d.ends_with("google.com")) {
+        if !yt_domain(d) {
             continue;
         }
         let exp = c["expires"].as_f64().or(c["expirationDate"].as_f64()).unwrap_or(0.0);
         let exp = if exp > 0.0 { exp as i64 } else { 4_102_444_800 };
         let b = |k: &str| if c[k].as_bool().unwrap_or(false) { "TRUE" } else { "FALSE" };
         out += &format!(
-            "{d}	{}	{}	{}	{exp}	{}	{}
-",
+            "{d}\t{}\t{}\t{}\t{exp}\t{}\t{}\n",
             if d.starts_with('.') { "TRUE" } else { "FALSE" },
             c["path"].as_str().unwrap_or("/"),
             b("secure"),
@@ -2412,57 +2462,13 @@ fn save_cookies(cs: &[serde_json::Value]) -> usize {
     n
 }
 
-fn kill_tree(pid: u32) {
-    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).creation_flags(0x0800_0000).output();
-}
-
-fn login_thread(w: Weak<App>) {
-    let say = |s: &str| {
-        let s = s.to_string();
-        let _ = w.upgrade_in_event_loop(move |ui| ui.set_status(s.into()));
-    };
-    let Some(exe) = browser_path() else { return say("No encontre Edge ni Chrome") };
-    let port = 9333;
-    let mut child = match Command::new(exe)
-        .arg(format!("--user-data-dir={}", data_dir().join("browser").display()))
-        .args([&format!("--remote-debugging-port={port}"), "--remote-allow-origins=*", "--no-first-run", "--no-default-browser-check", "https://www.youtube.com/"])
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return say(&format!("No pude abrir el navegador: {e}")),
-    };
-    say("Inicia sesion en la ventana que se abrio...");
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(600) {
-        std::thread::sleep(Duration::from_secs(2));
-        if let Ok(Some(_)) = child.try_wait() {
-            return say("Login cancelado");
-        }
-        let Some(cs) = fetch_cookies(port) else { continue };
-        let has = |n: &str| cs.iter().any(|c| c["name"] == n && c["domain"].as_str().unwrap_or("").ends_with("youtube.com"));
-        if has("LOGIN_INFO") && has("__Secure-3PSID") {
-            std::thread::sleep(Duration::from_secs(3));
-            let n = save_cookies(&fetch_cookies(port).unwrap_or(cs));
-            kill_tree(child.id());
-            say(&format!("Sesion iniciada ({n} cookies)"));
-            let _ = w.upgrade_in_event_loop(|ui| {
-                STATE.with(|s| s.borrow_mut().cache.clear());
-                load_tab(&ui, 0);
-            });
-            return;
-        }
-    }
-    kill_tree(child.id());
-    say("Tiempo de login agotado");
-}
-
 fn has_login(cs: &[serde_json::Value]) -> bool {
-    let has = |n: &str| cs.iter().any(|c| c["name"] == n && c["domain"].as_str().unwrap_or("").ends_with("youtube.com"));
+    let has = |n: &str| cs.iter().any(|c| c["name"] == n && yt_domain(c["domain"].as_str().unwrap_or("")));
     has("LOGIN_INFO") && has("__Secure-3PSID")
 }
 
 /// Recibe las cookies que manda la extension de Chrome (solo localhost).
-fn handle_sync(mut s: TcpStream, w: &Weak<App>) {
+fn handle_sync(mut s: TcpStream, w: &Weak<App>, ext_id: &str) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -2474,7 +2480,8 @@ fn handle_sync(mut s: TcpStream, w: &Weak<App>) {
         buf.extend_from_slice(&tmp[..n]);
         if let Some(p) = buf.windows(4).position(|x| x == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
-            if !head.starts_with("post /cookies") || !head.contains("x-ytop:") || !head.contains("origin: chrome-extension://") {
+            let origin = format!("origin: chrome-extension://{ext_id}");
+            if !head.starts_with("post /cookies") || !head.contains("x-ytop:") || !head.lines().any(|l| l.trim() == origin) {
                 let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 return;
             }
@@ -2506,11 +2513,20 @@ fn handle_sync(mut s: TcpStream, w: &Weak<App>) {
     }
 }
 
+/// El servidor solo se abre si existe %APPDATA%\ytop\sync_ext_id con el ID (32 letras) de tu extension, y
+/// solo acepta pedidos con ese origen: asi otra extension o proceso local no puede cambiar las cookies.
 fn start_sync_server(w: Weak<App>) {
+    let Some(id) = std::fs::read_to_string(data_dir().join("sync_ext_id"))
+        .ok()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| t.len() == 32 && t.chars().all(|c| c.is_ascii_lowercase()))
+    else {
+        return;
+    };
     std::thread::spawn(move || {
         let Ok(l) = TcpListener::bind("127.0.0.1:9334") else { return };
         for s in l.incoming().flatten() {
-            handle_sync(s, &w);
+            handle_sync(s, &w, &id);
         }
     });
 }
@@ -2560,7 +2576,25 @@ fn ram_mb() -> Option<(f64, f64)> {
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+static WAS_MIN: AtomicBool = AtomicBool::new(false);
+static REPAINT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Al restaurar la ventana minimizada Windows descarta su contenido y el renderizador por software solo
+/// repinta las zonas que cambian: se fuerza un repintado completo durante un instante.
+fn repaint_after_restore(ui: &App) {
+    let minimized = ui.window().is_minimized();
+    if WAS_MIN.swap(minimized, Relaxed) && !minimized {
+        REPAINT.store(4, Relaxed);
+    }
+    let n = REPAINT.load(Relaxed);
+    if n > 0 && !minimized {
+        REPAINT.store(n - 1, Relaxed);
+        ui.set_repaint_flag(!ui.get_repaint_flag());
+    }
+}
+
 fn tick(ui: &App, sh: &Shared) {
+    repaint_after_restore(ui);
     // en modo Video los controles se esconden tras 2.5 s sin mover el mouse (salvo en pausa o con el menu abierto)
     if cursor_moved() {
         LAST_ACT.store(T_ACT.elapsed().as_millis() as u64, Relaxed);
@@ -2600,10 +2634,7 @@ fn tick(ui: &App, sh: &Shared) {
 
 fn main() {
     audio::trace("inicio de la app");
-    let (sh, mut out) = match audio::start_output() {
-        Ok(x) => x,
-        Err(e) => return eprintln!("Audio: {e}"),
-    };
+    let (sh, mut out, audio_warn) = audio::start_output();
     sh.volume.store(80, Relaxed);
     let ui = App::new().unwrap();
 
@@ -2654,18 +2685,6 @@ fn main() {
                     }
                 });
             });
-        });
-    }
-    {
-        let w = ui.as_weak();
-        ui.on_login(move || {
-            if !LOGIN_RUNNING.swap(true, Relaxed) {
-                let w = w.clone();
-                std::thread::spawn(move || {
-                    login_thread(w);
-                    LOGIN_RUNNING.store(false, Relaxed);
-                });
-            }
         });
     }
     {
@@ -2896,7 +2915,7 @@ fn main() {
         let (w, sh) = (ui.as_weak(), sh.clone());
         ui.on_queue_jump(move |i| {
             if let Some(ui) = w.upgrade() {
-                start(&ui, &sh, i.max(0) as usize);
+                start(&ui, &sh, i.max(0) as usize + QBASE.load(Relaxed));
             }
         });
     }
@@ -2969,6 +2988,9 @@ fn main() {
 
     start_sync_server(ui.as_weak());
     load_tab(&ui, 0);
+    if let Some(m) = audio_warn {
+        ui.set_status(m.into());
+    }
     ui.run().unwrap();
     sh.gen.fetch_add(1, Relaxed);
     stop_video();
